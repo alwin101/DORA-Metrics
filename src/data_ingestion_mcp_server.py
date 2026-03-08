@@ -1,15 +1,18 @@
 """MCP data-ingestion server for DORA metrics.
 
 Primary source: GitLab.
-Additional sources: GitHub, local git repositories, and custom JSON payloads.
+Additional sources: GitHub, local git repositories, custom JSON payloads,
+and PagerDuty incidents for reliability metrics.
 
 Run:
     python -m src.data_ingestion_mcp_server
 
 Environment variables:
-    GITLAB_TOKEN            Personal access token for GitLab API
-    GITLAB_BASE_URL         Optional, defaults to https://gitlab.com
-    GITHUB_TOKEN            Optional token for GitHub API
+    GITLAB_TOKEN             Personal access token for GitLab API
+    GITLAB_BASE_URL          Optional, defaults to https://gitlab.com
+    GITHUB_TOKEN             Optional token for GitHub API
+    PAGERDUTY_TOKEN          Optional token for PagerDuty API
+    PAGERDUTY_BASE_URL       Optional, defaults to https://api.pagerduty.com
 """
 
 from __future__ import annotations
@@ -55,7 +58,6 @@ def _http_get_json(url: str, headers: dict[str, str] | None = None) -> Any:
         raise RuntimeError(f"Failed to reach {url}: {exc.reason}") from exc
 
 
-# In-memory buffer exposed as MCP resource for downstream agents.
 _EVENT_BUFFER: list[DoraEvent] = []
 
 
@@ -69,8 +71,24 @@ def _store_events(events: list[DoraEvent]) -> dict[str, Any]:
     }
 
 
+def _gitlab_pipeline_id_from_deployment(deployment: dict[str, Any]) -> int | None:
+    deployable = deployment.get("deployable") or {}
+    pipeline = deployable.get("pipeline") or {}
+    return pipeline.get("id")
+
+
+def _gitlab_sha_from_deployment(deployment: dict[str, Any]) -> str | None:
+    deployable = deployment.get("deployable") or {}
+    # Common shape includes deployable.commit.short_id/id; fallback to deployment.sha when present.
+    commit = deployable.get("commit") or {}
+    return commit.get("id") or deployment.get("sha")
+
+
 @mcp.tool(
-    description="Ingest deployment + change events from GitLab API. Primary ingestion method for DORA metrics."
+    description=(
+        "Ingest deployment + merged-change events from GitLab API (primary source). "
+        "Includes commit SHA / pipeline IDs to support lead-time joins."
+    )
 )
 def ingest_gitlab_project(
     project_id: str,
@@ -79,16 +97,6 @@ def ingest_gitlab_project(
     base_url: str | None = None,
     private_token: str | None = None,
 ) -> dict[str, Any]:
-    """Fetches merge requests and deployment records from a GitLab project.
-
-    Args:
-        project_id: Numeric project id or URL-encoded path (group%2Fproject).
-        since_iso: Optional ISO-8601 lower timestamp bound.
-        until_iso: Optional ISO-8601 upper timestamp bound.
-        base_url: Optional GitLab base URL.
-        private_token: Optional token; defaults to GITLAB_TOKEN env var.
-    """
-
     token = private_token or os.getenv("GITLAB_TOKEN")
     if not token:
         raise ValueError("No GitLab token found. Set GITLAB_TOKEN or pass private_token.")
@@ -113,6 +121,11 @@ def ingest_gitlab_project(
             continue
         if until_iso and merged_at > until_iso:
             continue
+
+        commit_sha = mr.get("merge_commit_sha") or mr.get("squash_commit_sha") or mr.get("sha")
+        pipeline = mr.get("head_pipeline") or {}
+        pipeline_id = pipeline.get("id")
+
         events.append(
             DoraEvent(
                 source="gitlab",
@@ -124,6 +137,8 @@ def ingest_gitlab_project(
                     "mr_iid": mr.get("iid"),
                     "title": mr.get("title"),
                     "web_url": mr.get("web_url"),
+                    "commit_sha": commit_sha,
+                    "pipeline_id": pipeline_id,
                 },
             )
         )
@@ -139,6 +154,8 @@ def ingest_gitlab_project(
 
         status = dep.get("status") or "unknown"
         event_type = "deployment_succeeded" if status == "success" else "deployment_finished"
+        pipeline_id = _gitlab_pipeline_id_from_deployment(dep)
+        commit_sha = _gitlab_sha_from_deployment(dep)
 
         events.append(
             DoraEvent(
@@ -151,6 +168,8 @@ def ingest_gitlab_project(
                     "deployment_id": dep.get("id"),
                     "status": status,
                     "environment": (dep.get("deployable") or {}).get("environment"),
+                    "commit_sha": commit_sha,
+                    "pipeline_id": pipeline_id,
                 },
             )
         )
@@ -158,7 +177,7 @@ def ingest_gitlab_project(
     return _store_events(events)
 
 
-@mcp.tool(description="Ingest merged PR + deployment data from GitHub repositories.")
+@mcp.tool(description="Ingest merged PR data from GitHub repositories.")
 def ingest_github_repo(
     owner: str,
     repo: str,
@@ -187,7 +206,12 @@ def ingest_github_repo(
                 timestamp=merged_at,
                 repository=f"{owner}/{repo}",
                 actor=(pr.get("user") or {}).get("login"),
-                metadata={"number": pr.get("number"), "title": pr.get("title"), "url": pr.get("html_url")},
+                metadata={
+                    "number": pr.get("number"),
+                    "title": pr.get("title"),
+                    "url": pr.get("html_url"),
+                    "commit_sha": pr.get("merge_commit_sha"),
+                },
             )
         )
 
@@ -200,13 +224,7 @@ def ingest_local_git(repo_path: str, since_iso: str | None = None) -> dict[str, 
     if not (path / ".git").exists():
         raise ValueError(f"{path} is not a git repository")
 
-    cmd = [
-        "git",
-        "-C",
-        str(path),
-        "log",
-        "--pretty=format:%H|%cI|%an|%s",
-    ]
+    cmd = ["git", "-C", str(path), "log", "--pretty=format:%H|%cI|%an|%s"]
     if since_iso:
         cmd.append(f"--since={since_iso}")
 
@@ -225,6 +243,89 @@ def ingest_local_git(repo_path: str, since_iso: str | None = None) -> dict[str, 
                 metadata={"sha": sha, "subject": subject},
             )
         )
+
+    return _store_events(events)
+
+
+@mcp.tool(description="Ingest PagerDuty incidents to support change-failure-rate and MTTR calculations.")
+def ingest_pagerduty_incidents(
+    since_iso: str | None = None,
+    until_iso: str | None = None,
+    service_ids_csv: str | None = None,
+    token: str | None = None,
+    base_url: str | None = None,
+) -> dict[str, Any]:
+    auth = token or os.getenv("PAGERDUTY_TOKEN")
+    if not auth:
+        raise ValueError("No PagerDuty token found. Set PAGERDUTY_TOKEN or pass token.")
+
+    root = (base_url or os.getenv("PAGERDUTY_BASE_URL") or "https://api.pagerduty.com").rstrip("/")
+
+    params: list[tuple[str, str]] = [
+        ("statuses[]", "triggered"),
+        ("statuses[]", "acknowledged"),
+        ("statuses[]", "resolved"),
+        ("limit", "100"),
+    ]
+    if since_iso:
+        params.append(("since", since_iso))
+    if until_iso:
+        params.append(("until", until_iso))
+    if service_ids_csv:
+        for service_id in [item.strip() for item in service_ids_csv.split(",") if item.strip()]:
+            params.append(("service_ids[]", service_id))
+
+    query = parse.urlencode(params)
+    incidents_url = f"{root}/incidents?{query}"
+
+    headers = {
+        "Accept": "application/vnd.pagerduty+json;version=2",
+        "Authorization": f"Token token={auth}",
+    }
+    payload = _http_get_json(incidents_url, headers=headers)
+    incidents = payload.get("incidents", []) if isinstance(payload, dict) else []
+
+    events: list[DoraEvent] = []
+    for incident in incidents:
+        incident_id = incident.get("id")
+        created_at = incident.get("created_at")
+        resolved_at = incident.get("resolved_at")
+        service = incident.get("service") or {}
+        title = incident.get("title")
+
+        if created_at:
+            events.append(
+                DoraEvent(
+                    source="pagerduty",
+                    event_type="incident_opened",
+                    timestamp=created_at,
+                    repository=service.get("summary") or "infrastructure",
+                    metadata={
+                        "incident_id": incident_id,
+                        "title": title,
+                        "service_id": service.get("id"),
+                        "urgency": incident.get("urgency"),
+                        "status": incident.get("status"),
+                    },
+                )
+            )
+
+        if resolved_at:
+            events.append(
+                DoraEvent(
+                    source="pagerduty",
+                    event_type="incident_resolved",
+                    timestamp=resolved_at,
+                    repository=service.get("summary") or "infrastructure",
+                    metadata={
+                        "incident_id": incident_id,
+                        "title": title,
+                        "service_id": service.get("id"),
+                        "urgency": incident.get("urgency"),
+                        "status": incident.get("status"),
+                    },
+                )
+            )
 
     return _store_events(events)
 
@@ -253,10 +354,7 @@ def ingest_custom_events(events_json: str) -> dict[str, Any]:
 
 @mcp.resource("dora://events/latest")
 def latest_ingested_events() -> str:
-    """Returns latest in-memory events for metrics agents.
-
-    Agents can subscribe/read this resource after calling ingestion tools.
-    """
+    """Returns latest in-memory events for metrics agents."""
 
     return json.dumps([asdict(event) for event in _EVENT_BUFFER], indent=2)
 
